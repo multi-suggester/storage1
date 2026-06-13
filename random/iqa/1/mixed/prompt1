@@ -1,0 +1,415 @@
+you are going to work on a İQA code our methodology will be splitting the topic
+into 3 , first testing if original model works properly with minimal changes
+that fixes how it works (csv , 20 to 100 instead of 0-100 etc ) (and then
+setting it as new baseline after confirming it works properly) 2 testing if some
+of the possible changes improves the model or not? ,comparison it with baseline
+to see if it improves it (does changing only dropout improves it ? , does
+changing loss formula improves it , does xxx ...... etc) 3 merging the seperate
+improvements to a final version(maybe few final versions to 1 ultimate version?)
+
+, this is our baseline methodology , list the possible minimal changes that
+shouldnt break the result etc
+
+(seperate the changes/improvements as :to be fixed, may be fixed , to be
+improved/tested sorta?)
+
+first few messeges will be improvements reviews and suggestions , after listing
+the possible improvements properly , and i will say when we will improve the
+code(probably now until first 3 messages
+
+add and think more about possible improvments and fixes as well and make a deep
+review about each improvement and possible changes and stuff (dont just go to
+default option , think on it and explain your reasoning and mention reasonable
+alternatives if exists and etc ,
+
+0.show some (around 40 random images and their real and predicted mos
+values)results after the test
+
+0.5 add a way to storing the best path as output on kaggle and then a function that checks if it exist otherwise trains instead of testing
+
+1.consider using bayesian algorithm to tune the hyper parameters becuase there
+is too many parameter (or search for an ompimized way to tune these parameter)
+
+1.1what do you think the ideal dropout value would be?
+
+1.2also should we freeze for longer? or is it good atm , we can increase the
+epoch to 100 if necessary
+
+1.3should we change learning rate? (also consider Cosine LR scheduler After
+unfreeze, decay LR smoothly to 1e-7. Targets the noisy oscillation seen in
+epochs 40–48.)
+
+1.4increase early stopping to 10? 2.4 increase epochs to 100? (maybe in the
+final version only? am unsure if this will make test take too long)
+
+3.  koniq csv has a training test validation split at column 10(or 9 for code)
+    am considering of using it and also avoid possible leakage by it (im
+    thinking train to learn and val to change values 4.the csv normally has
+    columns such as- image_name c1 c2 c3 c4 c5 c_total MOS SD set - so am
+    evaluating if i should change the loss function to punish based on std as
+    well? also fix the split according to set column 4.5 consider using srcc or
+    plcc in loss function as well? also im contemplating on whether to use rmse
+    ,mse or smoothl1
+
+find/add a way for checking if we have dying relu or not
+
+maybe 5. 5 crops (5–6): transforms.FiveCrop(224) takes 4 corners + center —
+deterministic, comprehensive, standard in IQA literature. The model runs all 5
+through the local extractor, then averages the 5 feature vectors before fusion.
+Much better than a single lucky/unlucky random crop. Implementing this.
+Attention: Not implementing now — it's an architectural decision that should be
+tested in isolation. Once this cleaner baseline is stable, CBAM on top of it is
+the logical next test (you already have the HyperIQA CBAM code to reference).
+
+sorta thing?
+
+
+you might be right about 5. MOS normalization maps to [20, 100], not [0, 100].
+(raw_score / 5.0) * 100 maps the KonIQ-10k range of 1–5 to 20–100. If you
+actually want a 0–100 scale, the formula should be (raw_score - 1) / 4.0 * 100.
+This doesn't affect PLCC/SRCC since they're rank-based correlations, but it
+affects loss magnitude and any absolute error metrics you might report.
+
+suggest some activation functions to me 6.No output activation. Your final
+linear layer can produce any value, including negatives or values above 100.
+Adding a torch.sigmoid(x) * 100 (or at minimum a torch.clamp(x, 0, 100)) in the
+forward pass keeps predictions in the valid MOS range and can slightly help
+training stability. 
+some offered keeping linear some offered sigmoid some
+offered softmax evaluate these and also suggest? different things etc (keep your
+mind open but make sure to evaluate the message and suggestions and etc properly
+
+baseline to be improved is on below import os import glob import pandas as pd
+import numpy as np import cv2 import matplotlib.pyplot as plt from scipy.stats
+import pearsonr, spearmanr from sklearn.model_selection import train_test_split
+
+import torch import torch.nn as nn import torch.optim as optim from
+torch.utils.data import Dataset, DataLoader from torchvision import transforms,
+models
+
+=====================================================================
+
+MODULE 1: GLOBAL CONFIGURATIONS & ASSUMPTIONS
+
+=====================================================================
+
+DATASET_PATH = '/kaggle/input/datasets/generalhawking/koniq-10k-dataset'
+BATCH_SIZE = 16 # Lowered from 32 because ResNet50 + Dual Inputs uses more VRAM
+LEARNING_RATE = 1e-4 # Lowered slightly; ResNet50 is deep and AdamW is sensitive
+EPOCHS = 50 PATIENCE = 5 # For Early Stopping DEVICE = torch.device("cuda" if
+torch.cuda.is_available() else "cpu")
+
+print(f"[*] Using Device: {DEVICE}")
+
+=====================================================================
+
+MODULE 2: DATA EXTRACTION (Preserved from original)
+
+=====================================================================
+
+all_image_paths = glob.glob(os.path.join(DATASET_PATH, '', '*.jpg'),
+recursive=True) csv_paths = glob.glob(os.path.join(DATASET_PATH, '', '*.csv'),
+recursive=True)
+
+image_paths, scores = [], []
+
+if len(csv_paths) > 0: df = pd.read_csv(csv_paths[0]) img_col = 'image' if
+'image' in df.columns else df.columns[0] score_col = 'MOS' if 'MOS' in
+df.columns else df.columns[7] score_dict = dict(zip(df[img_col], df[score_col]))
+
+for img_path in all_image_paths: img_name = os.path.basename(img_path) if
+img_name in score_dict: image_paths.append(img_path) # Guarantee 0-100 scale
+raw_score = score_dict[img_name] scores.append((raw_score / 5.0) * 100 if
+raw_score <= 5.0 else raw_score)
+
+Split 80/20 Deterministically
+
+train_paths, test_paths, train_scores, test_scores = train_test_split(
+image_paths, scores, test_size=0.20, random_state=42 )
+
+=====================================================================
+
+MODULE 3: THE DUAL-STREAM DATASET
+
+(Addressing the Resizing vs Cropping dilemma)
+
+=====================================================================
+
+class DualStreamIQADataset(Dataset): def init(self, image_paths, scores,
+transform_global, transform_local): self.image_paths = image_paths self.scores =
+scores self.transform_global = transform_global self.transform_local =
+transform_local
+
+def __len__(self):
+    return len(self.image_paths)
+
+def __getitem__(self, idx):
+    image = cv2.imread(self.image_paths[idx])
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    img_global = self.transform_global(image)
+    img_local = self.transform_local(image)
+    score = torch.tensor(self.scores[idx], dtype=torch.float32)
+
+    return img_global, img_local, score
+
+Global Transform (Shared between Train and Test)
+
+transform_global = transforms.Compose([ transforms.ToPILImage(),
+transforms.Resize((224, 224)), transforms.ToTensor(),
+transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) ])
+
+Local Transform (TRAIN) - Uses RandomCrop for Data Augmentation
+
+transform_local_train = transforms.Compose([ transforms.ToPILImage(),
+transforms.RandomCrop(224), transforms.ToTensor(),
+transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) ])
+
+Local Transform (TEST) - Uses CenterCrop for Deterministic Evaluation
+
+transform_local_test = transforms.Compose([ transforms.ToPILImage(),
+transforms.CenterCrop(224), # <--- FIX: No randomness during evaluation!
+transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406],
+std=[0.229, 0.224, 0.225]) ])
+
+Apply correct transforms to datasets
+
+train_dataset = DualStreamIQADataset(train_paths, train_scores,
+transform_global, transform_local_train) test_dataset =
+DualStreamIQADataset(test_paths, test_scores, transform_global,
+transform_local_test)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+num_workers=4) test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE,
+shuffle=False, num_workers=4)
+
+=====================================================================
+
+MODULE 4: DECOUPLED DUAL-STREAM RESNET50 (DEEPER HEAD + FREEZING)
+
+=====================================================================
+
+class DualStreamResNet50(nn.Module): def init(self): super(DualStreamResNet50,
+self).init()
+
+    resnet_global = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    resnet_local = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    
+    self.extractor_global = nn.Sequential(*list(resnet_global.children())[:-1])
+    self.extractor_local = nn.Sequential(*list(resnet_local.children())[:-1])
+    
+    # UPGRADED: Deeper, more stable regression head with BatchNorm
+    self.regression_head = nn.Sequential(
+        nn.Linear(2048 * 2, 1024),
+        nn.BatchNorm1d(1024),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        
+        nn.Linear(1024, 256),
+        nn.BatchNorm1d(256),
+        nn.ReLU(),
+        nn.Dropout(0.4),
+        
+        nn.Linear(256, 1)
+    )
+
+def forward(self, x_global, x_local):
+    feat_global = self.extractor_global(x_global).flatten(1)
+    feat_local = self.extractor_local(x_local).flatten(1) 
+    
+    fused_features = torch.cat((feat_global, feat_local), dim=1) 
+    return self.regression_head(fused_features).squeeze(1)
+
+# NEW: Methods to handle Gradual Unfreezing
+def freeze_backbones(self):
+    for param in self.extractor_global.parameters():
+        param.requires_grad = False
+    for param in self.extractor_local.parameters():
+        param.requires_grad = False
+
+def unfreeze_backbones(self):
+    for param in self.extractor_global.parameters():
+        param.requires_grad = True
+    for param in self.extractor_local.parameters():
+        param.requires_grad = True
+
+model = DualStreamResNet50().to(DEVICE)
+
+=====================================================================
+
+MODULE 5: LOSS, OPTIMIZER, AND AMP SCALER
+
+=====================================================================
+
+UPGRADED: SmoothL1Loss prevents bouncy gradients near the minimum
+
+criterion = nn.SmoothL1Loss(beta=1.0)
+
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+scaler = torch.amp.GradScaler(DEVICE.type)
+
+=====================================================================
+
+MODULE 6: TRAINING LOOP WITH GRADUAL UNFREEZING
+
+=====================================================================
+
+best_srcc = -1.0 epochs_no_improve = 0 history = {'train_loss': [], 'val_loss':
+[], 'val_plcc': [], 'val_srcc': []}
+
+FREEZE_EPOCHS = 2 # Train only the head for the first 2 epochs
+
+print("[*] Starting Training Loop...")
+
+for epoch in range(EPOCHS): # --- GRADUAL UNFREEZING LOGIC --- if epoch == 0:
+print("[!] Phase 1: Backbones FROZEN. Warming up Regression Head...")
+model.freeze_backbones() elif epoch == FREEZE_EPOCHS: print("[!] Phase 2:
+Backbones UNFROZEN. End-to-end fine-tuning begins...")
+model.unfreeze_backbones() # Optional but highly recommended: Lower the learning
+rate for fine-tuning for param_group in optimizer.param_groups:
+param_group['lr'] = LEARNING_RATE * 0.1
+
+# --- TRAINING PHASE ---
+model.train()
+running_loss = 0.0
+
+for img_global, img_local, targets in train_loader:
+    img_global, img_local, targets = img_global.to(DEVICE), img_local.to(DEVICE), targets.to(DEVICE)
+    
+    optimizer.zero_grad()
+    
+    with torch.autocast(device_type=DEVICE.type):
+        predictions = model(img_global, img_local)
+        loss = criterion(predictions, targets)
+        
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    
+    running_loss += loss.item()
+    
+avg_train_loss = running_loss / len(train_loader)
+
+# --- VALIDATION PHASE ---
+model.eval()
+val_loss = 0.0
+all_preds, all_targets = [], []
+
+with torch.no_grad():
+    for img_global, img_local, targets in test_loader:
+        img_global, img_local, targets = img_global.to(DEVICE), img_local.to(DEVICE), targets.to(DEVICE)
+        
+        with torch.autocast(device_type=DEVICE.type):
+            predictions = model(img_global, img_local)
+            loss = criterion(predictions, targets)
+            
+        val_loss += loss.item()
+        all_preds.extend(predictions.cpu().numpy())
+        all_targets.extend(targets.cpu().numpy())
+        
+avg_val_loss = val_loss / len(test_loader)
+plcc, _ = pearsonr(all_preds, all_targets)
+srcc, _ = spearmanr(all_preds, all_targets)
+
+history['train_loss'].append(avg_train_loss)
+history['val_loss'].append(avg_val_loss)
+history['val_plcc'].append(plcc)
+history['val_srcc'].append(srcc)
+
+print(f"Epoch {epoch+1:02d}/{EPOCHS} | Train Loss: {avg_train_loss:.2f} | Val Loss: {avg_val_loss:.2f} | PLCC: {plcc:.4f} | SRCC: {srcc:.4f}")
+
+# --- EARLY STOPPING & SAVING ---
+if srcc > best_srcc:
+    best_srcc = srcc
+    epochs_no_improve = 0
+    torch.save(model.state_dict(), 'best_iqa_model.pth')
+else:
+    epochs_no_improve += 1
+    if epochs_no_improve >= PATIENCE:
+        print(f"\n[!] Early Stopping triggered!")
+        break
+
+print(f"\n[*] Training Complete. Loading best model (SRCC: {best_srcc:.4f})")
+model.load_state_dict(torch.load('best_iqa_model.pth'))
+
+=====================================================================
+
+MODULE 7: VISUALIZATION (Result Graphs)
+
+=====================================================================
+
+plt.figure(figsize=(12, 5))
+
+Plot 1: Loss
+
+plt.subplot(1, 2, 1) plt.plot(history['train_loss'], label='Train L1 Loss',
+color='blue') plt.plot(history['val_loss'], label='Val L1 Loss', color='orange')
+plt.title('Training & Validation Loss') plt.xlabel('Epochs') plt.ylabel('Loss')
+plt.legend()
+
+Plot 2: Metrics
+
+plt.subplot(1, 2, 2) plt.plot(history['val_plcc'], label='PLCC', color='green')
+plt.plot(history['val_srcc'], label='SRCC', color='red') plt.title('IQA Metrics
+over Epochs') plt.xlabel('Epochs') plt.ylabel('Correlation (Closer to 1 is
+better)') plt.legend()
+
+plt.tight_layout() plt.savefig('training_results.png') plt.show() [] Using
+Device: cuda Downloading:
+"https://download.pytorch.org/models/resnet50-11ad3fa6.pth" to
+/root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth
+100%|██████████| 97.8M/97.8M [00:00<00:00, 221MB/s] []
+Starting Training Loop... [!] Phase 1: Backbones FROZEN. Warming up Regression
+Head... Epoch 01/50 | Train Loss: 55.39 | Val Loss: 53.76 | PLCC: -0.0561 |
+SRCC: -0.0272 Epoch 02/50 | Train Loss: 48.89 | Val Loss: 46.99 | PLCC: 0.2165 |
+SRCC: 0.1900 [!] Phase 2: Backbones UNFROZEN. End-to-end fine-tuning begins...
+Epoch 03/50 | Train Loss: 44.38 | Val Loss: 45.89 | PLCC: 0.2258 | SRCC: 0.2005
+Epoch 04/50 | Train Loss: 43.47 | Val Loss: 44.74 | PLCC: 0.3045 | SRCC: 0.2718
+Epoch 05/50 | Train Loss: 42.49 | Val Loss: 43.99 | PLCC: 0.3094 | SRCC: 0.2770
+Epoch 06/50 | Train Loss: 41.39 | Val Loss: 42.68 | PLCC: 0.2962 | SRCC: 0.2656
+Epoch 07/50 | Train Loss: 40.22 | Val Loss: 41.39 | PLCC: 0.2848 | SRCC: 0.2561
+Epoch 08/50 | Train Loss: 39.07 | Val Loss: 40.15 | PLCC: 0.3235 | SRCC: 0.2812
+Epoch 09/50 | Train Loss: 37.81 | Val Loss: 38.99 | PLCC: 0.3026 | SRCC: 0.2638
+Epoch 10/50 | Train Loss: 36.60 | Val Loss: 37.87 | PLCC: 0.3602 | SRCC: 0.3026
+Epoch 11/50 | Train Loss: 35.38 | Val Loss: 36.71 | PLCC: 0.4130 | SRCC: 0.3487
+Epoch 12/50 | Train Loss: 34.23 | Val Loss: 35.46 | PLCC: 0.4495 | SRCC: 0.3764
+Epoch 13/50 | Train Loss: 33.16 | Val Loss: 34.28 | PLCC: 0.5015 | SRCC: 0.4127
+Epoch 14/50 | Train Loss: 32.02 | Val Loss: 33.10 | PLCC: 0.5008 | SRCC: 0.4039
+Epoch 15/50 | Train Loss: 30.92 | Val Loss: 32.20 | PLCC: 0.5522 | SRCC: 0.4535
+Epoch 16/50 | Train Loss: 29.88 | Val Loss: 31.12 | PLCC: 0.6035 | SRCC: 0.4914
+Epoch 17/50 | Train Loss: 28.75 | Val Loss: 29.49 | PLCC: 0.5191 | SRCC: 0.4451
+Epoch 18/50 | Train Loss: 27.69 | Val Loss: 28.44 | PLCC: 0.6222 | SRCC: 0.5487
+Epoch 19/50 | Train Loss: 26.60 | Val Loss: 27.23 | PLCC: 0.5974 | SRCC: 0.5271
+Epoch 20/50 | Train Loss: 25.48 | Val Loss: 26.66 | PLCC: 0.5854 | SRCC: 0.5167
+Epoch 21/50 | Train Loss: 24.39 | Val Loss: 24.84 | PLCC: 0.6029 | SRCC: 0.5379
+Epoch 22/50 | Train Loss: 23.32 | Val Loss: 23.92 | PLCC: 0.5923 | SRCC: 0.5516
+Epoch 23/50 | Train Loss: 22.25 | Val Loss: 22.59 | PLCC: 0.6507 | SRCC: 0.5942
+Epoch 24/50 | Train Loss: 21.16 | Val Loss: 21.32 | PLCC: 0.6872 | SRCC: 0.6544
+Epoch 25/50 | Train Loss: 20.04 | Val Loss: 20.34 | PLCC: 0.7382 | SRCC: 0.6605
+Epoch 26/50 | Train Loss: 19.03 | Val Loss: 19.94 | PLCC: 0.7342 | SRCC: 0.6712
+Epoch 27/50 | Train Loss: 17.90 | Val Loss: 19.20 | PLCC: 0.7928 | SRCC: 0.7571
+Epoch 28/50 | Train Loss: 16.90 | Val Loss: 16.86 | PLCC: 0.8144 | SRCC: 0.7450
+Epoch 29/50 | Train Loss: 15.81 | Val Loss: 15.87 | PLCC: 0.7762 | SRCC: 0.7063
+Epoch 30/50 | Train Loss: 14.79 | Val Loss: 14.57 | PLCC: 0.8073 | SRCC: 0.7461
+Epoch 31/50 | Train Loss: 13.83 | Val Loss: 15.25 | PLCC: 0.8437 | SRCC: 0.7950
+Epoch 32/50 | Train Loss: 12.78 | Val Loss: 12.76 | PLCC: 0.8579 | SRCC: 0.8126
+Epoch 33/50 | Train Loss: 11.99 | Val Loss: 11.84 | PLCC: 0.8288 | SRCC: 0.7831
+Epoch 34/50 | Train Loss: 11.08 | Val Loss: 10.56 | PLCC: 0.8689 | SRCC: 0.8307
+Epoch 35/50 | Train Loss: 10.15 | Val Loss: 9.20 | PLCC: 0.8780 | SRCC: 0.8404
+Epoch 36/50 | Train Loss: 9.49 | Val Loss: 8.79 | PLCC: 0.8802 | SRCC: 0.8473
+Epoch 37/50 | Train Loss: 8.84 | Val Loss: 8.68 | PLCC: 0.8811 | SRCC: 0.8508
+Epoch 38/50 | Train Loss: 8.32 | Val Loss: 7.28 | PLCC: 0.8912 | SRCC: 0.8566
+Epoch 39/50 | Train Loss: 7.74 | Val Loss: 7.11 | PLCC: 0.8923 | SRCC: 0.8657
+Epoch 40/50 | Train Loss: 7.28 | Val Loss: 5.89 | PLCC: 0.9006 | SRCC: 0.8710
+Epoch 41/50 | Train Loss: 7.08 | Val Loss: 6.95 | PLCC: 0.8888 | SRCC: 0.8639
+Epoch 42/50 | Train Loss: 6.76 | Val Loss: 6.43 | PLCC: 0.8960 | SRCC: 0.8710
+Epoch 43/50 | Train Loss: 6.60 | Val Loss: 5.98 | PLCC: 0.8942 | SRCC: 0.8656
+Epoch 44/50 | Train Loss: 6.42 | Val Loss: 5.78 | PLCC: 0.9005 | SRCC: 0.8744
+Epoch 45/50 | Train Loss: 6.23 | Val Loss: 4.97 | PLCC: 0.9040 | SRCC: 0.8813
+Epoch 46/50 | Train Loss: 6.14 | Val Loss: 5.50 | PLCC: 0.9018 | SRCC: 0.8767
+Epoch 47/50 | Train Loss: 6.01 | Val Loss: 5.14 | PLCC: 0.8997 | SRCC: 0.8741
+Epoch 48/50 | Train Loss: 5.96 | Val Loss: 5.03 | PLCC: 0.9126 | SRCC: 0.8896
+Epoch 49/50 | Train Loss: 5.93 | Val Loss: 4.94 | PLCC: 0.9071 | SRCC: 0.8836
+Epoch 50/50 | Train Loss: 5.93 | Val Loss: 5.13 | PLCC: 0.9060 | SRCC: 0.8839
+
+[*] Training Complete. Loading best model (SRCC: 0.8896)
