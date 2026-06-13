@@ -1,0 +1,1243 @@
+IQA Code Improvement Review
+you are going to work on a İQA code our methodology will be splitting the topic
+into 3 , first testing if original model works properly with minimal changes
+that fixes how it works (csv , 20 to 100 instead of 0-100 etc ) (and then
+setting it as new baseline after confirming it works properly) 2 testing if some
+of the possible changes improves the model or not? ,comparison it with baseline
+to see if it improves it (does changing only dropout improves it ? , does
+changing loss formula improves it , does xxx ...... etc) 3 merging the seperate
+improvements to a final version(maybe few final versions to 1 ultimate version?)
+
+, this is our baseline methodology , list the possible minimal changes that
+shouldnt break the result etc
+
+(seperate the changes/improvements as :to be fixed, may be fixed , to be
+improved/tested sorta?)
+
+first few messeges will be improvements reviews and suggestions , after listing
+the possible improvements properly , and i will say when we will improve the
+code(probably now until first 3 messages
+
+add and think more about possible improvments and fixes as well and make a deep
+review about each improvement and possible changes and stuff (dont just go to
+default option , think on it and explain your reasoning and mention reasonable
+alternatives if exists and etc ,
+
+0.show some (around 40 random images and their real and predicted mos
+values)results after the test
+
+0.5 add a way to storing the best path as output on kaggle and then a function that checks if it exist otherwise trains instead of testing
+
+1.consider using bayesian algorithm to tune the hyper parameters becuase there
+is too many parameter (or search for an ompimized way to tune these parameter)
+
+1.1what do you think the ideal dropout value would be?
+
+1.2also should we freeze for longer? or is it good atm , we can increase the
+epoch to 100 if necessary
+
+1.3should we change learning rate? (also consider Cosine LR scheduler After
+unfreeze, decay LR smoothly to 1e-7. Targets the noisy oscillation seen in
+epochs 40–48.)
+
+1.4increase early stopping to 10? 2.4 increase epochs to 100? (maybe in the
+final version only? am unsure if this will make test take too long)
+
+3.  koniq csv has a training test validation split at column 10(or 9 for code)
+    am considering of using it and also avoid possible leakage by it (im
+    thinking train to learn and val to change values 4.the csv normally has
+    columns such as- image_name c1 c2 c3 c4 c5 c_total MOS SD set - so am
+    evaluating if i should change the loss function to punish based on std as
+    well? also fix the split according to set column 4.5 consider using srcc or
+    plcc in loss function as well? also im contemplating on whether to use rmse
+    ,mse or smoothl1
+
+find/add a way for checking if we have dying relu or not
+
+maybe 5. 5 crops (5–6): transforms.FiveCrop(224) takes 4 corners + center —
+deterministic, comprehensive, standard in IQA literature. The model runs all 5
+through the local extractor, then averages the 5 feature vectors before fusion.
+Much better than a single lucky/unlucky random crop. Implementing this.
+Attention: Not implementing now — it's an architectural decision that should be
+tested in isolation. Once this cleaner baseline is stable, CBAM on top of it is
+the logical next test (you already have the HyperIQA CBAM code to reference).
+
+sorta thing?
+
+
+you might be right about 5. MOS normalization maps to [20, 100], not [0, 100].
+(raw_score / 5.0) * 100 maps the KonIQ-10k range of 1–5 to 20–100. If you
+actually want a 0–100 scale, the formula should be (raw_score - 1) / 4.0 * 100.
+This doesn't affect PLCC/SRCC since they're rank-based correlations, but it
+affects loss magnitude and any absolute error metrics you might report.
+
+suggest some activation functions to me 6.No output activation. Your final
+linear layer can produce any value, including negatives or values above 100.
+Adding a torch.sigmoid(x) * 100 (or at minimum a torch.clamp(x, 0, 100)) in the
+forward pass keeps predictions in the valid MOS range and can slightly help
+training stability. 
+some offered keeping linear some offered sigmoid some
+offered softmax evaluate these and also suggest? different things etc (keep your
+mind open but make sure to evaluate the message and suggestions and etc properly
+
+baseline to be improved is on below import os import glob import pandas as pd
+import numpy as np import cv2 import matplotlib.pyplot as plt from scipy.stats
+import pearsonr, spearmanr from sklearn.model_selection import train_test_split
+
+import torch import torch.nn as nn import torch.optim as optim from
+torch.utils.data import Dataset, DataLoader from torchvision import transforms,
+models
+
+=====================================================================
+
+MODULE 1: GLOBAL CONFIGURATIONS & ASSUMPTIONS
+
+=====================================================================
+
+DATASET_PATH = '/kaggle/input/datasets/generalhawking/koniq-10k-dataset'
+BATCH_SIZE = 16 # Lowered from 32 because ResNet50 + Dual Inputs uses more VRAM
+LEARNING_RATE = 1e-4 # Lowered slightly; ResNet50 is deep and AdamW is sensitive
+EPOCHS = 50 PATIENCE = 5 # For Early Stopping DEVICE = torch.device("cuda" if
+torch.cuda.is_available() else "cpu")
+
+print(f"[*] Using Device: {DEVICE}")
+
+=====================================================================
+
+MODULE 2: DATA EXTRACTION (Preserved from original)
+
+=====================================================================
+
+all_image_paths = glob.glob(os.path.join(DATASET_PATH, '', '*.jpg'),
+recursive=True) csv_paths = glob.glob(os.path.join(DATASET_PATH, '', '*.csv'),
+recursive=True)
+
+image_paths, scores = [], []
+
+if len(csv_paths) > 0: df = pd.read_csv(csv_paths[0]) img_col = 'image' if
+'image' in df.columns else df.columns[0] score_col = 'MOS' if 'MOS' in
+df.columns else df.columns[7] score_dict = dict(zip(df[img_col], df[score_col]))
+
+for img_path in all_image_paths: img_name = os.path.basename(img_path) if
+img_name in score_dict: image_paths.append(img_path) # Guarantee 0-100 scale
+raw_score = score_dict[img_name] scores.append((raw_score / 5.0) * 100 if
+raw_score <= 5.0 else raw_score)
+
+Split 80/20 Deterministically
+
+train_paths, test_paths, train_scores, test_scores = train_test_split(
+image_paths, scores, test_size=0.20, random_state=42 )
+
+=====================================================================
+
+MODULE 3: THE DUAL-STREAM DATASET
+
+(Addressing the Resizing vs Cropping dilemma)
+
+=====================================================================
+
+class DualStreamIQADataset(Dataset): def init(self, image_paths, scores,
+transform_global, transform_local): self.image_paths = image_paths self.scores =
+scores self.transform_global = transform_global self.transform_local =
+transform_local
+
+def __len__(self):
+    return len(self.image_paths)
+
+def __getitem__(self, idx):
+    image = cv2.imread(self.image_paths[idx])
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    img_global = self.transform_global(image)
+    img_local = self.transform_local(image)
+    score = torch.tensor(self.scores[idx], dtype=torch.float32)
+
+    return img_global, img_local, score
+
+Global Transform (Shared between Train and Test)
+
+transform_global = transforms.Compose([ transforms.ToPILImage(),
+transforms.Resize((224, 224)), transforms.ToTensor(),
+transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) ])
+
+Local Transform (TRAIN) - Uses RandomCrop for Data Augmentation
+
+transform_local_train = transforms.Compose([ transforms.ToPILImage(),
+transforms.RandomCrop(224), transforms.ToTensor(),
+transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) ])
+
+Local Transform (TEST) - Uses CenterCrop for Deterministic Evaluation
+
+transform_local_test = transforms.Compose([ transforms.ToPILImage(),
+transforms.CenterCrop(224), # <--- FIX: No randomness during evaluation!
+transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406],
+std=[0.229, 0.224, 0.225]) ])
+
+Apply correct transforms to datasets
+
+train_dataset = DualStreamIQADataset(train_paths, train_scores,
+transform_global, transform_local_train) test_dataset =
+DualStreamIQADataset(test_paths, test_scores, transform_global,
+transform_local_test)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+num_workers=4) test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE,
+shuffle=False, num_workers=4)
+
+=====================================================================
+
+MODULE 4: DECOUPLED DUAL-STREAM RESNET50 (DEEPER HEAD + FREEZING)
+
+=====================================================================
+
+class DualStreamResNet50(nn.Module): def init(self): super(DualStreamResNet50,
+self).init()
+
+    resnet_global = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    resnet_local = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    
+    self.extractor_global = nn.Sequential(*list(resnet_global.children())[:-1])
+    self.extractor_local = nn.Sequential(*list(resnet_local.children())[:-1])
+    
+    # UPGRADED: Deeper, more stable regression head with BatchNorm
+    self.regression_head = nn.Sequential(
+        nn.Linear(2048 * 2, 1024),
+        nn.BatchNorm1d(1024),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        
+        nn.Linear(1024, 256),
+        nn.BatchNorm1d(256),
+        nn.ReLU(),
+        nn.Dropout(0.4),
+        
+        nn.Linear(256, 1)
+    )
+
+def forward(self, x_global, x_local):
+    feat_global = self.extractor_global(x_global).flatten(1)
+    feat_local = self.extractor_local(x_local).flatten(1) 
+    
+    fused_features = torch.cat((feat_global, feat_local), dim=1) 
+    return self.regression_head(fused_features).squeeze(1)
+
+# NEW: Methods to handle Gradual Unfreezing
+def freeze_backbones(self):
+    for param in self.extractor_global.parameters():
+        param.requires_grad = False
+    for param in self.extractor_local.parameters():
+        param.requires_grad = False
+
+def unfreeze_backbones(self):
+    for param in self.extractor_global.parameters():
+        param.requires_grad = True
+    for param in self.extractor_local.parameters():
+        param.requires_grad = True
+
+model = DualStreamResNet50().to(DEVICE)
+
+=====================================================================
+
+MODULE 5: LOSS, OPTIMIZER, AND AMP SCALER
+
+=====================================================================
+
+UPGRADED: SmoothL1Loss prevents bouncy gradients near the minimum
+
+criterion = nn.SmoothL1Loss(beta=1.0)
+
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+scaler = torch.amp.GradScaler(DEVICE.type)
+
+=====================================================================
+
+MODULE 6: TRAINING LOOP WITH GRADUAL UNFREEZING
+
+=====================================================================
+
+best_srcc = -1.0 epochs_no_improve = 0 history = {'train_loss': [], 'val_loss':
+[], 'val_plcc': [], 'val_srcc': []}
+
+FREEZE_EPOCHS = 2 # Train only the head for the first 2 epochs
+
+print("[*] Starting Training Loop...")
+
+for epoch in range(EPOCHS): # --- GRADUAL UNFREEZING LOGIC --- if epoch == 0:
+print("[!] Phase 1: Backbones FROZEN. Warming up Regression Head...")
+model.freeze_backbones() elif epoch == FREEZE_EPOCHS: print("[!] Phase 2:
+Backbones UNFROZEN. End-to-end fine-tuning begins...")
+model.unfreeze_backbones() # Optional but highly recommended: Lower the learning
+rate for fine-tuning for param_group in optimizer.param_groups:
+param_group['lr'] = LEARNING_RATE * 0.1
+
+# --- TRAINING PHASE ---
+model.train()
+running_loss = 0.0
+
+for img_global, img_local, targets in train_loader:
+    img_global, img_local, targets = img_global.to(DEVICE), img_local.to(DEVICE), targets.to(DEVICE)
+    
+    optimizer.zero_grad()
+    
+    with torch.autocast(device_type=DEVICE.type):
+        predictions = model(img_global, img_local)
+        loss = criterion(predictions, targets)
+        
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    
+    running_loss += loss.item()
+    
+avg_train_loss = running_loss / len(train_loader)
+
+# --- VALIDATION PHASE ---
+model.eval()
+val_loss = 0.0
+all_preds, all_targets = [], []
+
+with torch.no_grad():
+    for img_global, img_local, targets in test_loader:
+        img_global, img_local, targets = img_global.to(DEVICE), img_local.to(DEVICE), targets.to(DEVICE)
+        
+        with torch.autocast(device_type=DEVICE.type):
+            predictions = model(img_global, img_local)
+            loss = criterion(predictions, targets)
+            
+        val_loss += loss.item()
+        all_preds.extend(predictions.cpu().numpy())
+        all_targets.extend(targets.cpu().numpy())
+        
+avg_val_loss = val_loss / len(test_loader)
+plcc, _ = pearsonr(all_preds, all_targets)
+srcc, _ = spearmanr(all_preds, all_targets)
+
+history['train_loss'].append(avg_train_loss)
+history['val_loss'].append(avg_val_loss)
+history['val_plcc'].append(plcc)
+history['val_srcc'].append(srcc)
+
+print(f"Epoch {epoch+1:02d}/{EPOCHS} | Train Loss: {avg_train_loss:.2f} | Val Loss: {avg_val_loss:.2f} | PLCC: {plcc:.4f} | SRCC: {srcc:.4f}")
+
+# --- EARLY STOPPING & SAVING ---
+if srcc > best_srcc:
+    best_srcc = srcc
+    epochs_no_improve = 0
+    torch.save(model.state_dict(), 'best_iqa_model.pth')
+else:
+    epochs_no_improve += 1
+    if epochs_no_improve >= PATIENCE:
+        print(f"\n[!] Early Stopping triggered!")
+        break
+
+print(f"\n[*] Training Complete. Loading best model (SRCC: {best_srcc:.4f})")
+model.load_state_dict(torch.load('best_iqa_model.pth'))
+
+=====================================================================
+
+MODULE 7: VISUALIZATION (Result Graphs)
+
+=====================================================================
+
+plt.figure(figsize=(12, 5))
+
+Plot 1: Loss
+
+plt.subplot(1, 2, 1) plt.plot(history['train_loss'], label='Train L1 Loss',
+color='blue') plt.plot(history['val_loss'], label='Val L1 Loss', color='orange')
+plt.title('Training & Validation Loss') plt.xlabel('Epochs') plt.ylabel('Loss')
+plt.legend()
+
+Plot 2: Metrics
+
+plt.subplot(1, 2, 2) plt.plot(history['val_plcc'], label='PLCC', color='green')
+plt.plot(history['val_srcc'], label='SRCC', color='red') plt.title('IQA Metrics
+over Epochs') plt.xlabel('Epochs') plt.ylabel('Correlation (Closer to 1 is
+better)') plt.legend()
+
+plt.tight_layout() plt.savefig('training_results.png') plt.show() [] Using
+Device: cuda Downloading:
+"https://download.pytorch.org/models/resnet50-11ad3fa6.pth" to
+/root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth
+100%|██████████| 97.8M/97.8M [00:00<00:00, 221MB/s] []
+Starting Training Loop... [!] Phase 1: Backbones FROZEN. Warming up Regression
+Head... Epoch 01/50 | Train Loss: 55.39 | Val Loss: 53.76 | PLCC: -0.0561 |
+SRCC: -0.0272 Epoch 02/50 | Train Loss: 48.89 | Val Loss: 46.99 | PLCC: 0.2165 |
+SRCC: 0.1900 [!] Phase 2: Backbones UNFROZEN. End-to-end fine-tuning begins...
+Epoch 03/50 | Train Loss: 44.38 | Val Loss: 45.89 | PLCC: 0.2258 | SRCC: 0.2005
+Epoch 04/50 | Train Loss: 43.47 | Val Loss: 44.74 | PLCC: 0.3045 | SRCC: 0.2718
+Epoch 05/50 | Train Loss: 42.49 | Val Loss: 43.99 | PLCC: 0.3094 | SRCC: 0.2770
+Epoch 06/50 | Train Loss: 41.39 | Val Loss: 42.68 | PLCC: 0.2962 | SRCC: 0.2656
+Epoch 07/50 | Train Loss: 40.22 | Val Loss: 41.39 | PLCC: 0.2848 | SRCC: 0.2561
+Epoch 08/50 | Train Loss: 39.07 | Val Loss: 40.15 | PLCC: 0.3235 | SRCC: 0.2812
+Epoch 09/50 | Train Loss: 37.81 | Val Loss: 38.99 | PLCC: 0.3026 | SRCC: 0.2638
+Epoch 10/50 | Train Loss: 36.60 | Val Loss: 37.87 | PLCC: 0.3602 | SRCC: 0.3026
+Epoch 11/50 | Train Loss: 35.38 | Val Loss: 36.71 | PLCC: 0.4130 | SRCC: 0.3487
+Epoch 12/50 | Train Loss: 34.23 | Val Loss: 35.46 | PLCC: 0.4495 | SRCC: 0.3764
+Epoch 13/50 | Train Loss: 33.16 | Val Loss: 34.28 | PLCC: 0.5015 | SRCC: 0.4127
+Epoch 14/50 | Train Loss: 32.02 | Val Loss: 33.10 | PLCC: 0.5008 | SRCC: 0.4039
+Epoch 15/50 | Train Loss: 30.92 | Val Loss: 32.20 | PLCC: 0.5522 | SRCC: 0.4535
+Epoch 16/50 | Train Loss: 29.88 | Val Loss: 31.12 | PLCC: 0.6035 | SRCC: 0.4914
+Epoch 17/50 | Train Loss: 28.75 | Val Loss: 29.49 | PLCC: 0.5191 | SRCC: 0.4451
+Epoch 18/50 | Train Loss: 27.69 | Val Loss: 28.44 | PLCC: 0.6222 | SRCC: 0.5487
+Epoch 19/50 | Train Loss: 26.60 | Val Loss: 27.23 | PLCC: 0.5974 | SRCC: 0.5271
+Epoch 20/50 | Train Loss: 25.48 | Val Loss: 26.66 | PLCC: 0.5854 | SRCC: 0.5167
+Epoch 21/50 | Train Loss: 24.39 | Val Loss: 24.84 | PLCC: 0.6029 | SRCC: 0.5379
+Epoch 22/50 | Train Loss: 23.32 | Val Loss: 23.92 | PLCC: 0.5923 | SRCC: 0.5516
+Epoch 23/50 | Train Loss: 22.25 | Val Loss: 22.59 | PLCC: 0.6507 | SRCC: 0.5942
+Epoch 24/50 | Train Loss: 21.16 | Val Loss: 21.32 | PLCC: 0.6872 | SRCC: 0.6544
+Epoch 25/50 | Train Loss: 20.04 | Val Loss: 20.34 | PLCC: 0.7382 | SRCC: 0.6605
+Epoch 26/50 | Train Loss: 19.03 | Val Loss: 19.94 | PLCC: 0.7342 | SRCC: 0.6712
+Epoch 27/50 | Train Loss: 17.90 | Val Loss: 19.20 | PLCC: 0.7928 | SRCC: 0.7571
+Epoch 28/50 | Train Loss: 16.90 | Val Loss: 16.86 | PLCC: 0.8144 | SRCC: 0.7450
+Epoch 29/50 | Train Loss: 15.81 | Val Loss: 15.87 | PLCC: 0.7762 | SRCC: 0.7063
+Epoch 30/50 | Train Loss: 14.79 | Val Loss: 14.57 | PLCC: 0.8073 | SRCC: 0.7461
+Epoch 31/50 | Train Loss: 13.83 | Val Loss: 15.25 | PLCC: 0.8437 | SRCC: 0.7950
+Epoch 32/50 | Train Loss: 12.78 | Val Loss: 12.76 | PLCC: 0.8579 | SRCC: 0.8126
+Epoch 33/50 | Train Loss: 11.99 | Val Loss: 11.84 | PLCC: 0.8288 | SRCC: 0.7831
+Epoch 34/50 | Train Loss: 11.08 | Val Loss: 10.56 | PLCC: 0.8689 | SRCC: 0.8307
+Epoch 35/50 | Train Loss: 10.15 | Val Loss: 9.20 | PLCC: 0.8780 | SRCC: 0.8404
+Epoch 36/50 | Train Loss: 9.49 | Val Loss: 8.79 | PLCC: 0.8802 | SRCC: 0.8473
+Epoch 37/50 | Train Loss: 8.84 | Val Loss: 8.68 | PLCC: 0.8811 | SRCC: 0.8508
+Epoch 38/50 | Train Loss: 8.32 | Val Loss: 7.28 | PLCC: 0.8912 | SRCC: 0.8566
+Epoch 39/50 | Train Loss: 7.74 | Val Loss: 7.11 | PLCC: 0.8923 | SRCC: 0.8657
+Epoch 40/50 | Train Loss: 7.28 | Val Loss: 5.89 | PLCC: 0.9006 | SRCC: 0.8710
+Epoch 41/50 | Train Loss: 7.08 | Val Loss: 6.95 | PLCC: 0.8888 | SRCC: 0.8639
+Epoch 42/50 | Train Loss: 6.76 | Val Loss: 6.43 | PLCC: 0.8960 | SRCC: 0.8710
+Epoch 43/50 | Train Loss: 6.60 | Val Loss: 5.98 | PLCC: 0.8942 | SRCC: 0.8656
+Epoch 44/50 | Train Loss: 6.42 | Val Loss: 5.78 | PLCC: 0.9005 | SRCC: 0.8744
+Epoch 45/50 | Train Loss: 6.23 | Val Loss: 4.97 | PLCC: 0.9040 | SRCC: 0.8813
+Epoch 46/50 | Train Loss: 6.14 | Val Loss: 5.50 | PLCC: 0.9018 | SRCC: 0.8767
+Epoch 47/50 | Train Loss: 6.01 | Val Loss: 5.14 | PLCC: 0.8997 | SRCC: 0.8741
+Epoch 48/50 | Train Loss: 5.96 | Val Loss: 5.03 | PLCC: 0.9126 | SRCC: 0.8896
+Epoch 49/50 | Train Loss: 5.93 | Val Loss: 4.94 | PLCC: 0.9071 | SRCC: 0.8836
+Epoch 50/50 | Train Loss: 5.93 | Val Loss: 5.13 | PLCC: 0.9060 | SRCC: 0.8839
+
+[*] Training Complete. Loading best model (SRCC: 0.8896)
+We need to parse the user's request. The user wants us to work on an IQA code, splitting the topic into three phases: 1) fix minimal issues to get a clean baseline, 2) test individual improvements, 3) merge them into a final version. They want a list of possible minimal changes that shouldn't break the result, categorized as "to be fixed", "may be fixed", "to be improved/tested". They also provided a detailed list of suggestions and questions (items 0 to 6 and more) about improvements, and they want deep review, reasoning, and alternatives. They want to start with improvements reviews and suggestions, and they'll say when to actually improve the code. They want to add/think about more possible improvements and fixes, and not just go to default options.
+
+The user's message is long, but we need to extract all the points they want evaluated, and also add more improvements/fixes we can think of. They provided a baseline code. They listed several points: 0, 0.5, 1, 1.1, 1.2, 1.3, 1.4, 3, 4, 4.5, 5, 6, etc. Possibly there are some numbering issues: "0.show some (around 40 random images and their real and predicted mos values)results after the test" – that's a request to include a visualization of predictions vs targets. "0.5 add a way to storing the best path as output on kaggle and then a function that checks if it exist otherwise trains instead of testing" – a model checkpoint existence check. Then "1.consider using bayesian algorithm to tune the hyper parameters... 1.1 what do you think the ideal dropout value would be? 1.2 also should we freeze for longer? ... 1.3 should we change learning rate? ... 1.4 increase early stopping to 10? 2.4 increase epochs to 100? (maybe in the final version only? ...) 3. koniq csv has a training test validation split at column 10... 4. csv has columns ... 4.5 consider using srcc or plcc in loss function ... 5. 5 crops ... 6. No output activation ... suggest some activation functions ...". Also mentioned: "find/add a way for checking if we have dying relu or not" "maybe 5. 5 crops ..." "you might be right about 5. MOS normalization maps to [20, 100] ..." etc. So there's a lot to unpack.
+
+The user wants: "list the possible minimal changes that shouldnt break the result etc (seperate the changes/improvements as :to be fixed, may be fixed , to be improved/tested sorta?) first few messeges will be improvements reviews and suggestions , after listing the possible improvements properly , and i will say when we will improve the code (probably now until first 3 messages add and think more about possible improvments and fixes as well and make a deep review about each improvement and possible changes and stuff (dont just go to default option , think on it and explain your reasoning and mention reasonable alternatives if exists and etc ,"
+
+So I need to respond with a comprehensive review of the current baseline code, list all issues and potential improvements, categorize them, and provide deep reasoning for each. I should also propose additional improvements that I can think of beyond what they listed. I must not immediately implement code changes but provide a thorough analysis.
+
+I should structure my response with sections: Overview of baseline, categorization (To Be Fixed, May Be Fixed, To Be Improved/Tested), each with detailed sub-points, explaining the issue, reasoning, alternatives, and my recommendation. Include the suggestions from the user and more.
+
+Also address the specific items: 0 - display images, 0.5 - checkpoint existence check, 1 - hyperparameter tuning, 1.1 dropout value, 1.2 freeze duration, 1.3 learning rate scheduler, 1.4 early stopping patience and epochs, 3 - using the provided set split, 4 - using standard deviation and split according to set column, 4.5 - loss function incorporating correlation or std, choice of loss (MSE, SmoothL1, etc), 5 - FiveCrop, 6 - output activation, dying ReLU check. Also consider the normalization issue: they used (raw_score / 5.0) * 100 mapping to 20-100, but they want to discuss if mapping to 0-100 is better (the user mentioned "you might be right about 5. MOS normalization maps to [20, 100]..."). I'll discuss it.
+
+I'll need to produce a deep review. Since I'm the assistant, I'll craft a thorough message with explanations. The user wants the first few messages to be reviews and suggestions, and then they'll say when to start coding. So I'll output a long analytical message. I'll include a summary table for clarity, and then detailed discussion.
+
+I'll think of additional improvements: gradient clipping, different backbone (efficientnet, convnext), use of multi-scale features, attention mechanisms (CBAM, etc.), label smoothing, mixup, test-time augmentation, using more sophisticated early stopping based on PLCC/SRCC instead of just SRCC, using KFold cross-validation for final evaluation? But maybe not for baseline. I'll focus on minimal changes for now. They want minimal changes that shouldn't break the result, but also improvements to test separately. I'll separate them.
+
+I'll start with an introduction, then "Category 1: Necessary Fixes (Immediate Corrections)" which might include: normalization, using provided set split to avoid leakage, adding model checkpoint existence check, adding visualization of predictions, fixing the loss function consideration. Actually, the user considers some of these as part of the baseline improvements. They want to confirm if the original model works properly with minimal changes and then set it as a new baseline. So the "to be fixed" items are those that are essential for correctness and robustness. "May be fixed" are things like dropout value, unfreezing duration, LR schedule, early stopping parameters - they might improve but need testing. "To be improved/tested" are more experimental like adding CBAM, FiveCrop, using Bayesian hyperparameter tuning, etc.
+
+I'll thoroughly discuss each point. For instance, the normalization: The current code does (raw_score / 5.0) * 100 mapping 1-5 to 20-100. That's valid for rank correlation but for loss magnitude it's shifted. They could normalize to 0-100 to have zero-centered loss? Actually, it's not necessary for correlation but might affect convergence. I'll evaluate the options: (raw - 1)/4 * 100 for 0-100, or keep 20-100, or standardize targets (mean 0, std 1) as another option. I'll give reasoning.
+
+For the dataset split, they used random train_test_split ignoring the 'set' column in CSV which is meant for pre-defined splits. That's a potential data leakage if not using official splits. The KonIQ-10k paper used a specific split: 8,073 images for training, 2,000 for validation, and the rest for testing? The column 'set' might indicate training/validation/test sets. So using the provided set column is crucial to avoid overoptimistic results and to enable fair comparison with literature. So that is a "must fix".
+
+For the loss, they used SmoothL1Loss. I need to discuss MSE, MAE, Huber, and the idea of incorporating SRCC/PLCC in the loss (differentiable ranking loss). Adding std weighting could be useful, but they need to decide. I'll analyze.
+
+For output activation, they suggest clamping or sigmoid scaled to [0,100]. I'll analyze the effect on gradient flow, potential saturation, and whether it's needed. Alternatives: no activation, sigmoid*100, clamp, or using a tanh scaled to range. I'll provide reasoning. Also check dying ReLU: they could monitor percent of dead neurons (output zero for all inputs) and add a callback to log.
+
+Also, batch size, num_workers, AMP usage are fine. The code currently uses AMP. The training loop uses gradual unfreezing, which is good.
+
+I should also note that they have a comment: "Epoch 41-48 noisy oscillation" which they want to address with Cosine LR scheduler. So I'll suggest that as a potential improvement (to be tested).
+
+Now, for the "add a way to storing the best path as output on kaggle and then a function that checks if it exist otherwise trains instead of testing" – that's a simple utility to avoid retraining if the model is already saved. Good for debugging. I'll mention it.
+
+For the 40 random images visualization: they want to show real vs predicted MOS values after the test. That's easy to add.
+
+I'll list all these as separate points and categorize.
+
+I'll also think of other minimal improvements: adding weight decay (already there), maybe reducing batch size further if OOM, adding gradient clipping to stabilize, using ReduceLROnPlateau, using label smoothing, adding horizontal flip augmentation (since IQA is rotation-invariant, but maybe not). I'll mention them.
+
+I'll produce the response with clear sections and bullet points. I'll also mention that the current baseline yields SRCC 0.8896 which is quite good, but maybe due to random split leakage; using the official split might lower it. So that's why fixing the split is critical.
+
+I'll end by saying that once they've reviewed these suggestions, they can tell me to start implementing Phase 1 (fixes to get a clean baseline). I'll then code the changes.
+
+Now, let's craft the answer.
+
+We’ll proceed exactly as you outlined: first a thorough review of the current code and all suggestions, separating them into must‑fix, likely beneficial / may be fixed, and experimental / to be tested categories. I’ll add further improvements that are natural next steps. After this message you can say “go ahead” and I’ll start implementing the clean baseline.
+
+Current Baseline Summary
+Your code is a dual‑stream ResNet‑50 with a deep regression head (2048→1024→256→1), SmoothL1 loss, AdamW with AMP, gradual unfreezing (2 epochs frozen, then fine‑tune at 1/10 LR), early stopping on SRCC (patience=5).
+It reaches SRCC 0.8896 on the random 80/20 split – a strong number, but we need to verify that no data leakage inflates it.
+
+🔴 Category 1: To Be Fixed (Corrections that ensure correctness & reproducibility)
+These changes must be applied before any other improvement is evaluated, otherwise we risk building on a flawed baseline.
+
+Use the official ‘set’ column for train/val/test split
+
+Issue: The current train_test_split is random and ignores the pre‑defined splits (column 10, likely set). This can cause data leakage (e.g., images from the same scene ending up in both splits) and makes results incomparable to the literature.
+
+Fix: Read the set column; typical mapping is 0=training, 1=validation, 2=test (or similar). Use these fixed sets for training, validation, and testing. This is mandatory for a credible baseline.
+
+Reasoning: The authors designed these splits to avoid bias. Overlapping content would falsely boost metrics. All future hyperparameter tuning must be done on the validation set.
+
+MOS normalization range
+
+Issue: (raw_score / 5.0) * 100 maps raw scores from [1, 5] to [20, 100]. While rank correlations (SRCC/PLCC) are invariant to linear scaling, the magnitude of the loss and the network’s output scale can affect training dynamics (gradient scaling, bias initialisation).
+
+Options:
+a) Keep [20,100] – simple, works.
+b) Map to [0,100] with (raw_score - 1) / 4.0 * 100 – gives the intuitive full range, loss magnitudes become comparable to those in many papers.
+c) Standardise targets (z‑score) – mean 0, std 1 – common for regression but requires remembering to invert the transformation for final metrics.
+
+Recommendation: For a clean baseline, use option (b) [0,100] because it’s the most natural range and removes any offset. Later we can test standardisation as an improvement.
+
+Note: The choice does not affect correlation metrics if we invert correctly; we’ll still compute PLCC/SRCC after mapping back to original MOS if needed.
+
+Add model checkpoint existence check (Kaggle‑friendly)
+
+Request 0.5: Before training, check if a pre‑saved best model exists (e.g., best_iqa_model.pth in the Kaggle output directory). If it does, skip training and load it directly. This saves massive time during iterative experiments.
+
+Implementation: A simple if os.path.exists(best_model_path): load; return else train.
+
+Reason: Essential for rapid debugging and hyperparameter exploration.
+
+Visualisation: 40 random predictions vs. ground truth
+
+Request 0: After final testing, display a scatter plot (or a grid of images with predicted/actual scores) for ~40 randomly selected test images.
+
+Purpose: Gives an immediate sanity check of the model’s behaviour, reveals if predictions are systematically biased or outliers.
+
+Monitor dying ReLU / dead neurons
+
+Request: Add a logging hook that, after each epoch, calculates the fraction of neurons in the regression head that output exactly zero for the entire validation set. If this fraction becomes very high (>50%), we have a dead ReLU problem.
+
+Reason: With BatchNorm, dropout, and deep heads, it’s unlikely, but monitoring costs nothing and warns of bad initialisation or too‑aggressive learning rates.
+
+🟡 Category 2: May Be Fixed (Changes that are very likely to improve stability/performance, but need testing)
+These are low‑risk, well‑motivated modifications that we can test one by one against the fixed baseline. They do not alter the model architecture fundamentally.
+
+Learning rate scheduling after unfreezing
+
+Issue: The current approach drops LR to 1/10 at epoch 2 and keeps it constant afterwards. The logs show noisy oscillation around epochs 40‑48 (SRCC bouncing 0.88‑0.91). A smoother decay may help convergence.
+
+Suggested: Cosine annealing (as you proposed) starting from the moment backbones are unfrozen, e.g., CosineAnnealingLR with T_max = (total_epochs - freeze_epochs), eta_min = 1e-7.
+
+Alternative: ReduceLROnPlateau monitoring validation SRCC with a small patience. This is more robust to plateaus but slower.
+
+Recommendation: Test Cosine first because it’s deterministic and often yields a small boost in final SRCC for vision tasks.
+
+Increase early stopping patience to 10 (and monitor PLCC as well)
+
+Current: Patience = 5 on SRCC. With noisy validation metrics (SRCC can wiggle), 5 may be too aggressive and stop before a better local minimum.
+
+Improvement: Increase patience to 10, and monitor a combined metric – e.g., save the model when both SRCC and PLCC improve, or use a smoothed score. This avoids stopping on a single noisy peak.
+
+Also: Save the best model based on SRCC (as you do) but use PLCC as a tie‑breaker.
+
+Dropout values in regression head
+
+Question 1.1: Ideal dropout? Current values are 0.5 / 0.4. These are standard for fully‑connected layers.
+
+Reasoning: With a large head (1024→256), moderate dropout prevents co‑adaptation. Too high (>0.7) can underfit. 0.5 in the first layer and 0.4 in the second is sensible.
+
+Testing: Try a grid: (0.3,0.3), (0.4,0.3), (0.5,0.2). We’ll measure PLCC/SRCC and choose the best.
+
+Note: Dropout is less effective when BatchNorm is used in the same block; we already have BN before ReLU, then dropout, which is a common pattern (BN→ReLU→Dropout). That’s fine.
+
+Freeze duration
+
+Question 1.2: 2 epochs of frozen backbones are probably enough. The head is simple and learns quickly (loss drops sharply in first 2 epochs). Extending freezing to 3 or 5 epochs could warm the head further without moving the pretrained features, but the improvement is marginal.
+
+Testing: We can test freeze=3 epochs vs 2. If no meaningful difference, keep 2 for speed.
+
+Number of epochs
+
+*Question 1.4/2.4*: The model converges around epoch 40 (SRCC plateaus). Increasing to 100 epochs with early stopping patience=10 is harmless because early stopping will terminate earlier anyway. So we can safely set EPOCHS = 100 now. That costs no extra training time when improvements are minimal, but gives the scheduler room to work.
+
+Gradient clipping
+
+Observation: Not currently present. SmoothL1 loss with AMP generally avoids gradient explosions, but after unfreezing, gradients can become large for some inputs.
+
+Action: Add torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) after scaler.scale(loss).backward() and before scaler.step(). This is a safety net and rarely hurts.
+
+Batch size and AMP
+
+Status: Batch size 16 with AMP – seems stable. Could be increased to 32 if VRAM permits (ResNet‑50 dual stream is ~1.5 GB extra vs single). But 16 is fine; we’ll keep it.
+
+🔵 Category 3: To Be Improved / Tested (Architectural & training refinements with plausible benefits)
+These are changes that go beyond tweaking hyperparameters – they modify the training objective, data flow, or model structure. We will test them one at a time against the baseline.
+
+Output activation
+
+Issue: The final linear layer can output any real number, including negative or >100. In practice, the model learns to stay within the training range, but enforcing it can stabilise early training and avoid nonsensical predictions.
+
+Candidates:
+
+Sigmoid() * 100 – smooth, bounded (0,100), saturates at extremes (gradient vanishing).
+
+Clamp(0, 100) – hard bound, zero gradient outside, no effect on loss shape inside.
+
+Tanh * 50 + 50 – zero‑centered, softer saturation, range [0,100] if scaled appropriately.
+
+Linear (no activation) – what you currently have.
+
+Reasoning: For a model trained with L1‑type loss, a linear output is perfectly capable. Adding a sigmoid might hurt if targets are not perfectly within [0,100] and could cause training slowdown due to saturation. Clamp is non‑differentiable at boundaries, which can cause weird gradient behaviour.
+
+Recommendation: Keep linear for now, but add a simple torch.clamp only during evaluation to clip predictions to [0,100] for reporting. We can later test a Softplus or Sigmoid*100 as an improvement, but it is not a necessary fix.
+
+Loss function
+
+Current: SmoothL1Loss(beta=1.0) – a robust loss that behaves like MSE for small errors and L1 for large ones.
+
+Alternatives:
+
+MSE: penalises large errors more heavily, often yields slightly higher PLCC but can be sensitive to outliers.
+
+Huber (SmoothL1 with a different beta): beta around 10% of the typical target range (e.g., beta=10 for [0,100]) may be better.
+
+Ranking‑based loss (SRCC/PLCC differentiable approximation): e.g., use a differentiable Spearman loss (see “Spearman’s Rank Correlation Loss” in TensorFlow Ranking) or a pairwise ranking hinge loss. This directly optimises the metric we care about. However, it’s trickier to implement and may not converge stably without pre‑training.
+
+Weighted by STD: The CSV has a SD column. We could weight each sample’s loss by 1/(SD + epsilon) to give higher importance to reliably scored images. This might reduce noise from ambiguous images.
+
+Testing plan:
+a) Keep SmoothL1 as baseline.
+b) Test MSE vs. SmoothL1 with beta=10.
+c) Test loss weighted by inverse standard deviation.
+d) (Advanced) Test a differentiable SRCC loss, maybe only after everything else is stable.
+
+Note on combining SRCC/PLCC in loss: The phrase “using SRCC or PLCC in loss function” likely refers to a differentiable version. This is not trivial and often requires careful temperature scaling. I’d put it at the end of the experimental queue.
+
+Multi‑crop evaluation (FiveCrop)
+
+Idea: During testing, instead of a single center crop, take 5 deterministic crops (center + four corners), pass each through the local extractor, average the feature vectors before the head. This reduces variance and boosts SRCC slightly.
+
+Implementation: We already have a extractor_local that outputs a 2048‑dim vector. In evaluation, we can process the 5 crops, average the features, and forward once through the head.
+
+Cost: 5x forward pass for local stream, which is acceptable at test time.
+
+Note: This is a test‑time augmentation (TTA) method, not training. It can be added later, but we should first verify the baseline without it.
+
+Add CBAM or other attention
+
+Mention: You have HyperIQA CBAM code. Adding a light attention module (CBAM or a simple SE‑block) after each backbone could help the model focus on salient regions. This is an architectural change and should be tested after the above changes are settled.
+
+Hyperparameter tuning (Bayesian optimisation)
+
+Request 1: Too many parameters – dropout rates, LR, weight decay, freeze epochs, head dimensions, etc. Doing a grid search is inefficient. Bayesian optimisation (e.g., Optuna, Hyperopt) can find good combinations with few trials.
+
+Placement: We should do this after we have a stable baseline (Phase 2), not now. It’s a tool to maximise performance.
+
+Data augmentation
+
+Current: Only random crop for local stream, resize for global stream. No color jitter, horizontal flip, or rotation.
+
+Potential: Adding mild color jitter (brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05) and horizontal flip (since IQA is mostly invariant to left‑right) could regularise training and improve SRCC. Test this as a separate experiment.
+
+Alternative backbones
+
+Future: The dual‑stream can be built with EfficientNet‑B3, ConvNext‑tiny, or even a transformer. However, for the baseline, ResNet50 is solid.
+
+Explicit check for dying ReLU in head
+
+(Already classified under “To Be Fixed” – item 5)
+
+Summary Table of Changes
+Category	ID	Description	Priority / Phase
+🔴 Fix	1	Use official ‘set’ split	Phase 1 (baseline)
+🔴 Fix	2	Map MOS to [0,100] correctly	Phase 1
+🔴 Fix	3	Checkpoint existence check	Phase 1
+🔴 Fix	4	Visualise 40 predictions	Phase 1
+🔴 Fix	5	Monitor dead neurons	Phase 1
+🟡 May fix	6	Cosine LR scheduler after unfreeze	Phase 2 (test separately)
+🟡 May fix	7	Early stop patience=10, combine SRCC/PLCC	Phase 2
+🟡 May fix	8	Dropout tuning	Phase 2
+🟡 May fix	9	Freeze duration test (2 vs 3)	Phase 2
+🟡 May fix	10	Epochs to 100 (safe with early stop)	Phase 2
+🟡 May fix	11	Gradient clipping	Phase 2
+🟡 May fix	12	(Batch size unchanged)	–
+🔵 Test	13	Output activation (linear vs sigmoid)	Phase 2
+🔵 Test	14	Loss function variants & STD weighting	Phase 2
+🔵 Test	15	FiveCrop TTA	Phase 2/3
+🔵 Test	16	CBAM attention	Phase 3
+🔵 Test	17	Bayesian hyperparameter optimisation	Phase 3 (tool)
+🔵 Test	18	Data augmentation (color/flip)	Phase 2
+🔵 Test	19	Alternative backbones	Phase 3 (stretch)
+🔵 Test	20	(Already covered)	–
+Immediate Next Step (Phase 1)
+Once you give the green light, I will:
+
+Rewrite the data loading to use the set column.
+
+Change MOS normalisation to (raw_score - 1) / 4.0 * 100.
+
+Add the checkpoint existence check.
+
+Add prediction visualisation (scatter plot of 40 random test images).
+
+Add a callback that logs the fraction of dead ReLUs after each epoch.
+
+All other changes remain off, yielding a clean, reproducible baseline. Then we’ll run it, confirm it works, and only after that start testing individual improvements.
+
+Please confirm when to start coding Phase 1.
+
+try to improve my initial prompt
+id like you to ponder more on each side of this whether these are mergable or not , evaluate more comprehensively , dont just suggest 1 thing and leave it , try to promote pros and cons of all and act like you are devils adovcate while doing this perhaps?
+like for example on the output layer function one ai said this
+
+It is completely logical to think that a Sigmoid would be the optimal choice! If
+your data is bounded between 0 and 100, forcing the network to output a value
+exactly between 0 and 100 seems like the most mathematically sound approach.
+
+However, in the practice of deep learning—specifically for Regression tasks like
+Image Quality Assessment—a Sigmoid output layer is almost never optimal.
+
+Here is a breakdown of exactly why your current setup (Linear) or Softmax
+(Distribution) mathematically outperforms Sigmoid for predicting image quality.
+
+1. Why Sigmoid struggles with Regression (The Math)
+
+A Sigmoid function never actually reaches 0 or 1; it only approaches them as the
+internal numbers approach negative or positive infinity.
+
+  - The Extremes Problem: If an image is absolutely stunning and the
+    ground-truth target is 100, the network needs the Sigmoid to output 1.0. To
+    get a Sigmoid to output 0.999, the internal weights of the network have to
+    become massively huge. This causes weight explosion and instability.
+  - The "Blind Spot" (Vanishing Gradient): In deep learning, a network learns by
+    looking at the slope (gradient) of the output curve. The Sigmoid curve is
+    very steep in the middle (scores around 50), but almost completely flat at
+    the edges (scores above 85 or below 15). If the network predicts 90, but the
+    target is 100, the gradient (learning signal) is tiny because the curve is
+    flat. The network essentially goes "blind" to errors on really good or
+    really bad images, making it terrible at distinguishing between a "good"
+    image and a "perfect" image.
+
+2. Why Linear (Your Current Setup) is better than Sigmoid
+
+An nn.Linear layer is just a straight line.
+
+  - It has a constant gradient. Whether the image score is 10, 50, or 95, the
+    network gets the exact same strength of learning signal when it makes a
+    mistake.
+  - Because human ratings of quality are continuous, a linear layer allows the
+    network to smoothly rank images without its weights exploding to reach the
+    top or bottom of a curve.
+  - Note: If you look at state-of-the-art regression models (like predicting
+    house prices, age estimation, or image quality), 99% of them use a raw
+    Linear output.
+
+3. Why Softmax (NIMA approach) is considered the "True Optimal" for IQA
+
+If you read top-tier research papers on Image Quality Assessment (like Google's
+NIMA model), they argue that predicting a single number (whether via Linear or
+Sigmoid) is fundamentally flawed because image quality is subjective.
+
+If 10 people look at an image, 2 might give it a 60, 5 might give it an 80,
+and 3 might give it a 100. The average is 82.
+
+  - A Linear/Sigmoid model just outputs 82.
+  - A Softmax model outputs a probability distribution over buckets (e.g., 20%
+    chance of 60, 50% chance of 80, 30% chance of 100).
+
+Softmax is considered optimal for IQA because it doesn't just predict the
+average score; it predicts how much humans will agree or disagree on the score.
+
+Summary
+
+1.  Classification (Cat vs Dog): Sigmoid is optimal. You want absolute certainty
+    (0 or 1).
+2.  Standard Regression (Predicting a single MOS score): Linear is optimal. It
+    prevents vanishing gradients and allows smooth ranking. (This is what you
+    are doing, and it is the correct choice).
+3.  Advanced Subjective Regression (Predicting human voting patterns): Softmax
+    over discrete buckets is optimal, but it requires you to change your loss
+    function (to Earth Mover's Distance) and requires the raw votes of every
+    human rater, not just the final average score.
+We need to parse the user's request carefully. The user previously gave a detailed prompt with many suggestions for improving their IQA code. I responded with a structured breakdown, categorizing changes into fixes, may-fix, and test. Now the user says:
+
+"try to improve my initial prompt
+id like you to ponder more on each side of this whether these are mergable or not , evaluate more comprehensively , dont just suggest 1 thing and leave it , try to promote pros and cons of all and act like you are devils adovcate while doing this perhaps?
+like for example on the output layer function one ai said this ..."
+
+They want me to improve their initial prompt. That initial prompt was the list of changes/improvements they wanted to consider. I need to re-evaluate that prompt and produce a more comprehensive, deeper analysis, playing devil's advocate, exploring pros/cons of each change, whether they can be merged, and presenting a more nuanced discussion. The user gave an example of how another AI argued against sigmoid output and suggested softmax with Earth Mover's Distance. So they want that level of depth.
+
+Thus, my task is to revise my previous response? No, they want me to "improve my initial prompt" – meaning the initial set of suggestions they gave to me, the user wants me to expand on that, give a deeper review of each potential change, with pros/cons, and also discuss mergeability. This is an instruction to me as the assistant: take the original list of ideas they wrote, and produce a more thorough analysis. They want me to act like a devil's advocate, not just accept each idea, but weigh alternatives.
+
+I need to craft a comprehensive message that revisits each bullet point from their initial message, and provides a deep evaluation: logical reasoning, pros/cons, merge considerations, interaction effects. I should also think about dependencies: which changes can be tested independently vs. together. They want this before we start coding.
+
+The user said: "first few messeges will be improvements reviews and suggestions , after listing the possible improvements properly , and i will say when we will improve the code(probably now until first 3 messages". So we are still in the review phase. They are asking me to do a better job on that review.
+
+I'll structure my response by grouping the original suggestions (0, 0.5, 1, 1.1, ...) and diving deep into each, with a devil's advocate angle. Also, I need to address the new info about output activation and softmax: the user cited another AI's argument against sigmoid, in favor of linear or softmax. That aligns with my earlier recommendation to keep linear, but I should expand on the softmax option, its feasibility, and whether it's worth exploring. Also, the user originally mentioned "some offered keeping linear some offered sigmoid some offered softmax evaluate these and also suggest? different things etc". So I need to cover all output options comprehensively.
+
+I'll create a structured analysis, perhaps in sections: "Output Activation Function", "Loss Function", "Data Splitting", "Normalization", "Hyperparameters", etc. For each, I'll present multiple options with rigorous pros/cons, potential pitfalls, and interaction with other changes.
+
+Additionally, the user asked about merging: they want to know which changes can be combined in the final version. I need to discuss merging separate improvements, testing order, possible synergies/conflicts.
+
+Thus, the response will be a long, detailed improvement review, acting as a devil's advocate. I'll try to keep it organized but thorough.
+
+I'll start with the core fixes and then move to more experimental ones. I'll incorporate the output activation discussion at length, referencing the argument provided. I'll also mention the possibility of using softmax with EMD if they have the raw votes (but they only have MOS and SD, not full distribution). That's an important constraint.
+
+I'll also consider how changes like five-crop TTA, CBAM, and attention might interact.
+
+I need to maintain the same helpful tone. The user wants "deep review about each improvement and possible changes and stuff (dont just go to default option , think on it and explain your reasoning and mention reasonable alternatives if exists". That's exactly what I'll do.
+
+I'll produce a message that is an improved version of my initial baseline review, with deeper dives. Since the user is also mentioning "our methodology will be splitting the topic into 3", my response can map changes to phases. But that might be too much. I'll focus on the review.
+
+Let's craft the response.
+
+You’re asking for a far more rigorous, devil’s‑advocate review of the entire improvement space – treating every suggested change as a hypothesis that must survive scrutiny, weighing alternatives, and carefully thinking about which ideas can coexist and which will interfere. I’ll re‑examine the list from your original prompt point by point, but now with deeper technical arguments, pros/cons of each option, and a frank discussion of mergeability and experimental sequence.
+
+I’ll group the items thematically, then for each I’ll:
+
+Present the current baseline behaviour.
+
+List plausible alternatives (not just one “best”).
+
+Act as devil’s advocate: show why each alternative might fail or backfire, and under what conditions it could help.
+
+Discuss interactions with other potential changes (especially those that alter the loss landscape or model capacity).
+
+Conclude with a recommended testing order and whether the change is a standalone fix, a tunable, or an architectural risk.
+
+At the end I’ll synthesise a suggested merge plan for the three phases.
+
+0. Visualisation of ~40 random predictions + ground truth
+Baseline: No visual output beyond metric curves.
+
+Options:
+
+A scatter plot of predicted vs. true MOS (single figure).
+
+A grid of actual images with predictions annotated (more expensive but far more diagnostic).
+
+Kernel density plots of errors.
+
+Devil’s advocate:
+
+A simple scatter plot can be misleading if the data range is small; outliers dominate the visual.
+
+Showing images with predictions might reveal failures, but also biases us toward anecdotal interpretation. It can be time‑consuming to generate on Kaggle.
+
+Adding this doesn’t affect the model, so it is always safe to include.
+Mergeability: Completely orthogonal to every other change. Do it immediately in Phase 1.
+
+Verdict: Must‑fix for human sanity‑checking. No downside.
+
+0.5. Checkpoint existence check to skip training
+Baseline: Always trains from scratch.
+
+Alternatives:
+
+A simple file existence check (if os.path.exists(...)) to load the best model and skip training entirely.
+
+More elaborate: store hash of hyperparameters and skip only if exactly the same configuration was run before.
+
+Devil’s advocate:
+
+On Kaggle, output directories may not persist across sessions; this might never trigger in practice.
+
+Could lead to accidental use of a stale model when code changes but hyperparameters appear the same – we must ensure the checkpoint is invalidated when code changes.
+
+However, for iterative development, this is a huge time‑saver.
+
+Interactions: Must be robust to code modifications. A good practice: save alongside a small config.json containing hyperparameters and a hash of the code; load only if hash matches.
+
+Verdict: Must‑fix for practical workflow. With a config hash, it becomes almost zero‑risk.
+
+1. Use Bayesian optimisation for hyperparameter tuning
+Baseline: Manual or grid search.
+
+Options:
+
+Optuna (TPE sampler) or Hyperopt.
+
+Random search as a simple baseline.
+
+Manual tuning with a well‑designed experiment plan.
+
+Devil’s advocate:
+
+Bayesian opt works well for continuous parameters but may over‑exploit a noisy validation signal (SRCC/PLCC have high variance per epoch). Without repeated runs, it might pick a lucky configuration.
+
+The objective function is computationally expensive: each trial trains for ~50 epochs. Even 20 trials become heavy.
+
+It is better to first narrow the search space with cheap manual experiments (e.g., test one parameter at a time) and then use Bayesian opt only for the final fine‑tuning of 2‑3 critical knobs (like dropout and LR).
+
+Over‑optimisation on the validation set can degrade test performance (no free lunch).
+
+Interactions: The search space is dependent on all previous design choices (architecture, loss, normalisation). If we later change the model, the hyperparameters may need re‑tuning.
+
+Verdict: Keep for Phase 3 after the architecture and loss are frozen. Not a baseline necessity.
+
+1.1. Ideal dropout value?
+Baseline: (0.5, 0.4) in two layers.
+
+Options:
+
+Keep current.
+
+Tune to (0.3, 0.3), (0.4, 0.2), (0.5, 0.2), (0.2, 0.2).
+
+Use spatial dropout? Not applicable here.
+
+Apply dropout only after the first linear layer, not the second.
+
+Devil’s advocate:
+
+Dropout and BatchNorm together are known to sometimes cause variance shift at test time because BN expects consistent activation scales; dropout adds noise. However, applying dropout after BN (as we do) mitigates this. Still, some works suggest removing dropout when using BN.
+
+If we already have strong regularisation from dual‑stream and data augmentation, dropout might be unnecessary or even harmful, reducing capacity.
+
+The head is relatively deep (1024→256), so some regularisation is likely needed. But there’s no guarantee 0.5/0.4 is optimal; it’s a guess.
+
+We can sweep dropout values with a short run (20 epochs) to identify a good region.
+
+Interactions: Dropout rate interacts with weight decay, learning rate, and batch size. It also interacts with the number of free parameters. If we later change the head dimensions, we must re‑tune.
+
+Verdict: Tunable improvement – test in Phase 2 with a quick manual sweep.
+
+1.2. Should we freeze for longer?
+Baseline: 2 epochs frozen.
+
+Options:
+
+0 epochs (no freezing) – train end‑to‑end from start.
+
+2, 3, 5, 10 epochs frozen.
+
+Progressive unfreezing (unfreeze layers gradually).
+
+Devil’s advocate:
+
+The head is randomly initialised; if we unfreeze the backbone too early, noisy gradients from the head could corrupt pretrained features, especially with a high learning rate. Freezing for a few epochs allows the head to align roughly.
+
+However, if the head learns quickly (loss drops from 55 to ~49 in epoch 1), maybe 1 epoch is enough. 2 epochs might already be enough; further freezing only delays full model learning and could waste compute budget.
+
+In some tasks, no freezing works fine because the pretrained features are already so generic that the head can be trained jointly from scratch without much damage.
+
+The current practice is a safety net. Extending to 3 or 5 may not hurt but likely brings no benefit. We can test by comparing SRCC after equal total epochs; if no diff, keep 2.
+
+Interactions: Freeze duration affects the effective schedule of LR. If we then switch to a cosine scheduler, the starting point matters less because the LR will decay gradually after unfreeze.
+
+Verdict: Low‑priority tunable. Test 2 vs 0 vs 4 quickly in Phase 2.
+
+1.3. Learning rate and Cosine LR scheduler
+Baseline: Constant LR after unfreeze (1e‑5, since 1e‑4 * 0.1).
+
+Alternatives:
+
+Cosine annealing to 1e‑7 over remaining epochs.
+
+ReduceLROnPlateau on validation loss/SRCC.
+
+OneCycleLR (not typical for fine‑tuning).
+
+Keep constant.
+
+Devil’s advocate:
+
+Cosine annealing forces a predetermined decay shape that may not match the loss landscape. If the model needs a long plateau at medium LR to escape saddle points, cosine may reduce LR too early, causing premature convergence.
+
+The oscillation in epochs 40‑48 could be due to LR being too high for a rugged loss surface, but it could also be due to batch‑to‑batch noise or even beneficial exploration. Cosine decay might smooth the final few epochs but could also trap the model in a slightly worse minimum if not tuned.
+
+An alternative is to use a plateau‑based scheduler that only drops LR when SRCC stalls for 3‑4 epochs; this is more robust and less sensitive to the exact schedule.
+
+Cosine is simple and works well in many fine‑tuning tasks, so it’s a reasonable baseline scheduler to test.
+
+Interactions: The scheduler’s effect depends on the initial LR after unfreeze, which itself depends on the freeze/unfreeze strategy and the base LR. If we switch to a more aggressive loss (MSE), the optimal LR might change.
+
+Verdict: High‑impact may‑fix. Test Cosine vs. Plateau in Phase 2.
+
+1.4. Increase early stopping patience to 10?
+Baseline: Patience = 5, monitoring SRCC.
+
+Alternatives:
+
+Patience 10 on SRCC.
+
+Monitor a smoothed SRCC (exponential moving average) to avoid stopping on noise.
+
+Monitor PLCC and SRCC jointly, stop only when both fail to improve for N epochs.
+
+Use a threshold on validation loss plateau.
+
+Devil’s advocate:
+
+SRCC per epoch is noisy because it’s computed on the whole validation set, but still has variance due to model stochasticity (dropout at test time? No, dropout is off). The noise may come from the exact loss minimum reached; early stopping with small patience can be too conservative.
+
+Patience 5 with 50 epochs means training can stop as early as epoch ~30 if SRCC stops improving, potentially missing later gains. Indeed, your logs show SRCC still increasing after epoch 30 (0.8126 -> 0.8896 by epoch 48). If you’d used patience 5 from epoch 31 peak (0.8126), it would have stopped well before the true peak. So the current patience of 5 is clearly too aggressive given the long upward trend.
+
+We need to look at the actual improvement trajectory: the model improves steadily until epoch ~40, then fluctuates. Patience 10 would have allowed it to keep going. I’d argue patience=10 is a fix, not just a may‑fix.
+
+Interactions: If we add a LR scheduler that decays LR, the metric might still improve slowly over many epochs, so a longer patience is needed.
+
+Verdict: Fix for baseline – increase patience to 10 or even 12. Also save best model based on combined SRCC+PLCC.
+
+2. (No item 2 explicitly, maybe epochs to 100)
+Baseline: 50 epochs.
+Option: 100 epochs with early stopping.
+Devil’s advocate: If early stopping triggers at epoch 40-48, increasing the maximum epochs does nothing but provides safety margin. No downside, except an extra line of code. So this is a harmless fix.
+
+3. Use official ‘set’ column split to avoid leakage
+Baseline: Random 80/20 split.
+
+Options:
+
+Use official train/val/test split.
+
+Stratified split based on MOS buckets to preserve distribution.
+
+K‑fold cross‑validation on the training set (but then we lose a held‑out test set).
+
+Devil’s advocate:
+
+The random split might accidentally put similar‑content images in train and test, inflating metrics. Using the official split ensures a realistic distribution and is comparable to published results. This is a fundamental correctness issue. Without it, any performance we report is unreliable.
+
+The official set column might have only train/test (two splits) or train/val/test. We must inspect the CSV. Typically KonIQ‑10k has 7,000 training, 2,000 validation, 1,000 test (or similar). We can use training for training, validation for hyperparameter decisions, and test for final evaluation. This aligns with standard practice.
+
+The downside: the training set becomes smaller (~7k instead of 8k), which could slightly reduce performance, but the integrity gain far outweighs that.
+
+Mergeability: This split defines the entire data pipeline; all subsequent experiments must use it. It must be applied first.
+
+Verdict: Critical fix. Highest priority.
+
+4. MOS normalisation: (raw_score/5.0)*100 vs (raw_score-1)/4*100 vs standardisation
+Baseline: (raw_score/5.0)*100 => [20,100].
+
+Options:
+
+Option A: Keep [20,100].
+
+Option B: Map to [0,100] using (raw-1)/4*100.
+
+Option C: Z‑score normalisation (mean 0, std 1).
+
+Option D: Min‑max to [0,1] then multiply by 100 (same as B essentially).
+
+Devil’s advocate:
+
+The network’s bias and initial weight scale might be slightly affected by the output range. With [20,100], the final layer’s bias will likely learn to be around 60 initially. That’s fine, but if we later add a sigmoid, we’d need to rescale.
+
+Rank correlations (SRCC, PLCC) are invariant to any monotonic transformation, so the choice doesn’t affect our primary metrics, but it does affect the loss magnitude and the gradient scale. SmoothL1 loss is not scale‑invariant; with [20,100] the errors are ~0‑80, while with [0,100] they are ~0‑100 – negligible difference.
+
+Standardisation (z‑score) changes the loss magnitude to ~1, which might require adjusting the initial learning rate and the beta of SmoothL1. It also makes it harder to interpret raw predictions. However, it’s common in regression when combining with classification heads. Not necessary here.
+
+The formula (raw_score/5.0)*100 implicitly assumes raw scores can be exactly 0? But KonIQ‑10k scores are 1‑5, so mapping yields 20‑100. If we ever want to predict scores below 20 (impossible in this dataset), that’s not an issue. The network can output <20, it just won’t be trained on that range. So option A is perfectly reasonable. Option B maps 1→0, 5→100, which is a simple linear transformation. It makes the range 0‑100, which is more intuitive and matches many IQA datasets. I’d choose B just for cleanliness, but it’s not critical.
+
+Mergeability: Changing normalisation changes target values, which requires retraining any model. It’s a one‑time decision.
+
+Verdict: Fix – settle on (raw-1)/4*100 for intuitive 0‑100 range. No strong reason to do otherwise.
+
+5. FiveCrop (test‑time augmentation) and architectural implications
+Your idea: Replace the single random crop in training? Actually, you mentioned FiveCrop for evaluation – averaging features of 5 crops. This is a deterministic TTA. You also mentioned not implementing now, but testing later.
+
+Devil’s advocate:
+
+FiveCrop TTA increases test time 5x. For Kaggle notebooks, might be acceptable.
+
+It reduces spatial sampling variance, which can boost SRCC by ~0.005‑0.01, but it may mask problems in the model’s spatial robustness. If the model heavily relies on a single lucky crop, TTA papers over it.
+
+Implementing FiveCrop requires modification of the local stream pipeline to accept multiple crops per image and pool features. That’s a code change that might interact with batch size (need to flatten batches or iterate). It’s safe to add as an evaluation‑only mode.
+
+In training, using random crop already provides stochastic augmentation; FiveCrop would be overkill and slow.
+
+Interactions: If we later add attention (CBAM), the local features become spatially weighted, making multiple crops potentially redundant. So we should test FiveCrop on the baseline first, then after attention, to see if the benefit disappears.
+
+Verdict: Testing in Phase 2/3, not a baseline fix. Worth a try.
+
+6. Output activation (sigmoid, linear, softmax, clamp)
+Context: You quoted an AI that strongly argued against sigmoid, favouring linear (or softmax with EMD). Let me expand, playing devil’s advocate for every side.
+
+6.1 Linear (current)
+Pros:
+
+Constant gradient everywhere; no saturation.
+
+Unconstrained output can match any target range; network can learn to stay within [0,100] if needed.
+
+Simple, compatible with any loss.
+
+Used in almost all regression IQA models (e.g., HyperIQA, dipIQ, etc.).
+
+Cons:
+
+No guarantee output stays in [0,100]; extreme inputs can cause wild predictions (rare but possible).
+
+At the start of training, outputs can be very large, leading to high loss spikes.
+
+Mitigation: Gradient clipping and good weight initialisation handle this.
+
+6.2 Sigmoid * 100
+Pros:
+
+Outputs naturally in (0,100), no impossible negative scores.
+
+Can be seen as a form of bounded regression.
+
+Cons (strong):
+
+Vanishing gradient at extremes: As the quoted argument says, to hit 100, the pre‑activation must be large positive, where sigmoid gradient is nearly zero. This makes it hard to learn to distinguish a 95 from a 100. In practice, the network would rarely output >90 because gradients vanish, resulting in a systematic under‑prediction of high‑quality images.
+
+Weight explosion: The network may push weights to very high magnitudes to saturate the sigmoid, causing instability.
+
+Non‑linear saturation distorts the loss landscape, making optimisation harder.
+
+It’s practically never used in IQA regression for these reasons.
+
+When could it work? If the target range is small and far from saturation (e.g., 0.2‑0.8), but MOS is wide (0‑100). So it’s a bad fit.
+
+6.3 Clamp(x, 0, 100) (hard)
+Pros:
+
+Enforces valid range without affecting training gradients inside (since clamp is differentiable only outside the range? Actually, clamp has zero gradient for x<0 or x>100, which is a problem if a prediction erroneously falls outside during training – the gradient is killed, so the model won’t correct it. So clamp during training is harmful. It’s only safe to apply after training for reporting.)
+
+Verdict: Never use clamp in the forward pass during training. Only for evaluation display.
+
+6.4 Softmax over discrete buckets (NIMA‑style)
+This requires the dataset to have the raw rating distribution (histogram of votes). KonIQ‑10k provides MOS (mean opinion score) and standard deviation, but not the full per‑image rating distribution from all raters. So we cannot train a NIMA model properly. We could approximate a distribution from MOS+SD (e.g., assuming Gaussian), but that’s not the same as real subjective distribution. The EMD loss (Earth Mover’s Distance) would be applied to a guessed distribution, which might not improve over direct regression. This path is technically infeasible without the raw votes. So softmax is not a practical option for this dataset.
+
+6.5 Other activations: Softplus, Tanh scaled, etc.
+Softplus (smooth ReLU) + offset could map to [0, ∞), then scale to [0,100]? Not bounded, but softly encourages positive values. Not needed.
+
+Tanh * 50 + 50: maps to (-50,150) roughly, still bounded but saturates like sigmoid, albeit less severely because the range is wider. Still has vanishing gradient at extremes.
+
+Identity: essentially linear.
+
+Conclusion: Linear output is the only rational choice for this data. The earlier AI’s argument is solid.
+
+Recommendation: Stick with linear. For evaluation, we can torch.clamp(pred, 0, 100) for cleaner reports, but no activation in training.
+
+Mergeability: Changing output activation would require retraining and might not be compatible with certain loss functions (e.g., Huber). We are safe to keep linear and move on.
+
+7. Loss function: SmoothL1 vs MSE vs Huber vs weighted by STD vs rank loss
+7.1 SmoothL1 (current beta=1.0)
+Pros: Robust to outliers, less sensitive to large errors, smooth gradient. Good for noisy MOS where occasional rating inconsistencies exist.
+Cons: Beta=1.0 means the transition from L2 to L1 occurs at error=1.0, which on 0‑100 scale is tiny. Essentially the loss is L2 for errors <1 and L1 for errors >1. L1‑like behaviour dominates, which might under‑penalize large mistakes. Could be okay.
+
+7.2 MSE
+Pros: Strongly penalizes large errors, leading to better calibration if outliers are not excessive. Often used in IQA.
+Cons: Sensitive to outliers (if a single image has an erroneous MOS, MSE will skew the model). The standard deviation column could help identify outliers, but we’re not using it yet.
+
+7.3 Huber (SmoothL1 with beta=10)
+Beta is the threshold where loss switches from squared to linear. With beta=10, errors up to 10 are treated as squared, beyond linear. This might balance the two. Worth a test.
+
+7.4 Loss weighted by inverse standard deviation
+The idea: images with low std (strong consensus) are more reliable, so we weight their loss higher.
+Pros: Could reduce noise from ambiguous images.
+Cons: If the model overfits to ‘easy’ images, it might underperform on difficult ones, and SRCC/PLCC treat all images equally. Weighting might bias the model away from hard examples, which could actually hurt correlation on the whole test set, because hard images might be the ones where discrimination matters most. This is non‑trivial. Need to test carefully. It could also interact with data balancing (some MOS levels have different std). Not a clear win.
+
+7.5 Rank‑based loss (differentiable SRCC/PLCC)
+Pros: Directly optimizes the metric we care about.
+Cons: Hard to implement robustly; often unstable without warm‑starting with MSE. Requires pairwise comparisons, which scales quadratically. Most attempts in IQA show marginal improvement over MSE, and sometimes worse. Probably overkill for our baseline.
+
+7.6 Earth Mover’s Distance (EMD) with bucket distribution
+Not possible without raw votes.
+
+Recommendation: Keep SmoothL1 as baseline, but test MSE and Huber (beta=10) in Phase 2. Also test the STD‑weighted loss as an experiment, but be prepared for null or negative results.
+
+Mergeability: Loss function interacts with output range and the need for gradient clipping. Changing loss is a single‑line change, easily testable.
+
+8. Use SRCC or PLCC in loss function (differentiable)
+Covered above under rank loss. Not recommended now.
+
+9. Monitoring dying ReLU in regression head
+Implementation: After each epoch, on a subset of validation data, record the output of each ReLU layer (after activation) and compute the fraction of units that are exactly zero for all samples. If >50% consistently, the head is unhealthy.
+Pros: Catches a real failure mode; cost is negligible.
+Cons: None. It’s a safety diagnostic.
+Verdict: Must‑fix as a sanity check.
+
+10. Gradient clipping
+Baseline: Not present.
+Pros: Prevents loss spikes, especially early in training or after unfreezing.
+Cons: If max_norm is too small, it can slow learning. 1.0 is a common safe value.
+Verdict: Fix for stability.
+
+11. Data augmentation (color jitter, flip)
+Baseline: Only random crop.
+Options:
+
+Horizontal flip (p=0.5) – IQA is generally invariant, but some images may have text or directional lighting; flip might alter perceived quality. Very low risk.
+
+Mild color jitter (brightness/contrast 0.1) – could act as regulariser. Might hurt if the model relies on subtle color distortions for quality assessment (chromatic aberration). Usually safe for IQA.
+
+Random rotation – could break composition‑based quality cues; not recommended.
+
+Pros: Regularisation, reduced overfitting.
+Cons: Might distort the true quality signal (e.g., a poorly white‑balanced image after jitter could look better/worse, confusing the label). Need to test. Many IQA models use horizontal flip only.
+
+Verdict: Test horizontal flip alone, then possibly mild jitter, in Phase 2.
+
+12. Hyperparameter tuning approach (Bayesian)
+Already covered: postpone to Phase 3.
+
+13. CBAM / attention modules
+Baseline: No attention.
+Pros: Can help the model focus on salient regions, improving local‑global fusion. HyperIQA uses a similar idea.
+Cons: Adds parameters, increases risk of overfitting, requires careful integration. The current dual‑stream already uses a global and a local view; attention might be redundant.
+Testing: After the baseline with TTA and optimised head, we can try adding a lightweight SE‑block or CBAM after each ResNet stage. Compare.
+
+Verdict: Phase 3 experimental.
+
+14. FiveCrop as architectural decision
+Already discussed.
+
+15. Normalization formula (raw_score/5)*100 vs raw_score-1/4*100
+Already settled.
+
+Mergeability and experimental sequence
+I’ll now propose a concrete plan that respects the “3‑phase” methodology:
+
+Phase 1 – Clean Baseline (Must‑fix)
+These changes correct data handling and reproducibility. All are mandatory before any tuning:
+
+Use official set column split.
+
+MOS mapping to [0,100] via (raw-1)/4*100.
+
+Checkpoint existence check (with config hash).
+
+Visualisation of 40 predictions.
+
+Add dying ReLU monitor.
+
+Increase early stopping patience to 10, epochs to 100.
+
+Add gradient clipping.
+
+Optionally, add a linear output clamp only for logging (no training effect).
+
+Outcome: A trustworthy baseline with SRCC/PLCC that we can compare against.
+
+Phase 2 – Iterative Single‑Change Experiments
+Here we test one improvement at a time (or two if they are clearly independent) against the baseline. Each experiment will be recorded. Suggested order (based on likely impact and dependency):
+
+Experiment A: LR scheduling (Cosine vs Plateau) – because it can affect convergence speed and final SRCC.
+
+Experiment B: Dropout values (quick sweep 0.2‑0.5).
+
+Experiment C: Freeze epochs (0, 2, 4).
+
+Experiment D: Loss function (MSE, Huber beta=10).
+
+Experiment E: STD‑weighted loss (if promising after D).
+
+Experiment F: Horizontal flip augmentation.
+
+Experiment G: FiveCrop TTA (evaluation‑only).
+
+Experiment H: (Optional) Color jitter.
+
+Merging rule: Any improvement that yields a statistically significant SRCC gain on the validation set (using the official val split) is kept; otherwise discarded. We can then combine all accepted improvements into a candidate “Phase‑2 optimal” model.
+
+Phase 3 – Architecture & Advanced Tuning
+With the training recipe fixed, we can test:
+
+CBAM attention blocks.
+
+Bayesian optimisation of the final hyperparameters (LR, weight decay, dropout) using the Phase‑2 model as starting point.
+
+FiveCrop + attention synergy.
+
+Possibly larger backbone (ConvNeXt‑tiny) if time permits.
+
+Finally, the best model becomes the ultimate version.
+
+This sequential, controlled approach avoids the spaghetti of untracked changes and ensures we always know what caused improvements.
+
+Shall I now proceed to implement Phase 1 (the clean baseline) as described, with all the must‑fix items? That would be the concrete next step.
+
